@@ -1,0 +1,1 @@
+@/Users/partha/.sdkman/candidates/tornadovm/current/tornado-argfile -XstartOnFirstThread --enable-native-access=ALL-UNNAMED

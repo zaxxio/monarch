@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- Colored console output, Spring Boot style -->
+    <property name="CONSOLE_LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) %magenta(${PID:- }) --- [%15.15thread] %cyan(%-40.40logger{39}) : %msg%n"/>
+
+    <!-- If you want to see PID, uncomment the line above and add:
+         <property name="PID" value="12345"/>
+         Or set it via -Dlogback.pid=...
+    -->
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- Quiet down noisy libraries -->
+    <logger name="org.apache"           level="WARN"/>
+    <logger name="uk.ac.manchester"     level="WARN"/>  <!-- TornadoVM internals -->
+    <logger name="org.graalvm"          level="WARN"/>
+    <logger name="jdk.internal"         level="WARN"/>
+
+    <!-- Your code at DEBUG or INFO -->
+    <logger name="org.monarch.nn"       level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>
