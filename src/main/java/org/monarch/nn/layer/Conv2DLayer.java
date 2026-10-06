@@ -16,12 +16,13 @@ import java.util.Random;
  * Filters : [C_out, C_in, K_h, K_w]
  * Output: [B, C_out, H_out, W_out]
  *
- *   H_out = (H + 2*padding - K_h) / stride + 1
- *   W_out = (W + 2*padding - K_w) / stride + 1
+ * Loop order is (oc, ic, kh, kw) outside and a contiguous run over
+ * output columns inside, with the horizontal padding bounds hoisted out
+ * of the inner loop. The JIT can auto-vectorize that axpy loop.
  *
- * Optimized path: caches all strides, accesses the raw data arrays
- * directly (no Tensor.get()/set() overhead), and runs the batch
- * dimension across all CPU cores.
+ * Backward has no shared accumulators:
+ *   dW / db : parallel over (oc, ic) pairs, each owns its filter slice
+ *   dX      : parallel over batch, each sample owns its dX slice
  */
 public class Conv2DLayer extends Layer {
 
@@ -30,8 +31,12 @@ public class Conv2DLayer extends Layer {
     private final int stride, padding;
     private final double initStd;
     private final long seed;
+    private final boolean computeInputGrad;
 
     private int inH, inW, outH, outW;
+
+    // Valid output-column range per kernel column kw (hoisted bounds check)
+    private int[] owLo, owHi;
 
     private Tensor filters;        // [C_out, C_in, K_h, K_w]
     private double[] biases;       // [C_out]
@@ -53,12 +58,18 @@ public class Conv2DLayer extends Layer {
         this.nIn          = inChannels;
         this.nOut         = outChannels;
         this.seed         = b.seed;
+        this.computeInputGrad = b.computeInputGrad;
         this.initStd      = b.initStd > 0 ? b.initStd
                 : Math.sqrt(2.0 / (inChannels * kernelH * kernelW));
     }
 
     @Override
     public LayerType getType() { return LayerType.CONV2D; }
+
+    public int getKernelH() { return kernelH; }
+    public int getKernelW() { return kernelW; }
+    public int getStride()  { return stride; }
+    public int getPadding() { return padding; }
 
     @Override
     public void init(int[] inputShape) {
@@ -80,6 +91,18 @@ public class Conv2DLayer extends Layer {
             throw new IllegalStateException(
                     "Conv2D produces invalid output size: "
                     + outH + "x" + outW);
+
+        // For each kw, the output columns whose input column is in range:
+        //   iw = ow*stride - padding + kw  in [0, inW)
+        owLo = new int[kernelW];
+        owHi = new int[kernelW];
+        for (int kw = 0; kw < kernelW; kw++) {
+            int lo = (padding - kw) > 0 ? (padding - kw + stride - 1) / stride : 0;
+            int num = inW - 1 + padding - kw;
+            int hi = num >= 0 ? Math.min(outW, num / stride + 1) : 0;
+            owLo[kw] = lo;
+            owHi[kw] = hi;
+        }
 
         Random rng = new Random(seed);
         filters    = new Tensor(outChannels, inChannels, kernelH, kernelW);
@@ -122,6 +145,8 @@ public class Conv2DLayer extends Layer {
         final double[] fD = filters.getData();
         final double[] zD = z.getData();
         final double[] yD = y.getData();
+        final double[] bias = biases;
+        final int[] lo = owLo, hi = owHi;
         final IActivationFunction fn = ActivationsFactory.get(activationFunction);
 
         final int xSampleStride = inChannels * inH * inW;
@@ -132,43 +157,46 @@ public class Conv2DLayer extends Layer {
         final int zOutStride    = outH * outW;
 
         Parallel.forRange(B, b -> {
-            int xSampleBase = b * xSampleStride;
-            int zSampleBase = b * zSampleStride;
+            final int xBase = b * xSampleStride;
+            final int zBase = b * zSampleStride;
 
             for (int oc = 0; oc < outChannels; oc++) {
-                double bias = biases[oc];
-                int fOutBase = oc * fOutStride;
-                int zOutBase = zSampleBase + oc * zOutStride;
+                final int zOc = zBase + oc * zOutStride;
+                Arrays.fill(zD, zOc, zOc + zOutStride, bias[oc]);
+                final int fOc = oc * fOutStride;
 
-                for (int oh = 0; oh < outH; oh++) {
-                    int zRowBase = zOutBase + oh * outW;
-                    for (int ow = 0; ow < outW; ow++) {
-                        double sum = bias;
-                        int ohS = oh * stride - padding;
+                for (int ic = 0; ic < inChannels; ic++) {
+                    final int xIc = xBase + ic * xChanStride;
+                    final int fIc = fOc + ic * fChanStride;
 
-                        for (int ic = 0; ic < inChannels; ic++) {
-                            int xChannelBase = xSampleBase + ic * xChanStride;
-                            int fChannelBase = fOutBase + ic * fChanStride;
+                    for (int kh = 0; kh < kernelH; kh++) {
+                        for (int kw = 0; kw < kernelW; kw++) {
+                            final double w = fD[fIc + kh * kernelW + kw];
+                            final int cLo = lo[kw], cHi = hi[kw];
+                            if (cLo >= cHi) continue;
 
-                            for (int kh = 0; kh < kernelH; kh++) {
-                                int ih = ohS + kh;
+                            for (int oh = 0; oh < outH; oh++) {
+                                int ih = oh * stride - padding + kh;
                                 if (ih < 0 || ih >= inH) continue;
-                                int xRowBase = xChannelBase + ih * inW;
-                                int fRowBase = fChannelBase + kh * kernelW;
+                                int zRow = zOc + oh * outW;
+                                int xRow = xIc + ih * inW - padding + kw;
 
-                                for (int kw = 0; kw < kernelW; kw++) {
-                                    int iw = ow * stride - padding + kw;
-                                    if (iw < 0 || iw >= inW) continue;
-                                    sum += xD[xRowBase + iw] * fD[fRowBase + kw];
+                                if (stride == 1) {
+                                    for (int ow = cLo; ow < cHi; ow++)
+                                        zD[zRow + ow] += w * xD[xRow + ow];
+                                } else {
+                                    for (int ow = cLo; ow < cHi; ow++)
+                                        zD[zRow + ow] += w * xD[xRow + ow * stride];
                                 }
                             }
                         }
-                        int idx = zRowBase + ow;
-                        zD[idx] = sum;
-                        yD[idx] = fn.output(sum);
                     }
                 }
             }
+
+            // Activation pass
+            for (int i = zBase, end = zBase + zSampleStride; i < end; i++)
+                yD[i] = fn.output(zD[i]);
         });
 
         lastZ = z;
@@ -181,13 +209,16 @@ public class Conv2DLayer extends Layer {
     @Override
     public Tensor backward(Tensor gradOutput) {
         final int B = lastInput.getShape()[0];
-        Tensor dInput = new Tensor(B, inChannels, inH, inW);
+        final Tensor dInput = new Tensor(B, inChannels, inH, inW);
 
-        final double[] xD    = lastInput.getData();
-        final double[] fD    = filters.getData();
-        final double[] gD    = gradOutput.getData();
-        final double[] zD    = lastZ.getData();
-        final double[] dXD   = dInput.getData();
+        final double[] xD  = lastInput.getData();
+        final double[] fD  = filters.getData();
+        final double[] gD  = gradOutput.getData();
+        final double[] zD  = lastZ.getData();
+        final double[] dXD = dInput.getData();
+        final double[] fgD = filterGrad.getData();
+        final double[] bg  = biasGrad;
+        final int[] lo = owLo, hi = owHi;
 
         final IActivationFunction fn = ActivationsFactory.get(activationFunction);
 
@@ -198,71 +229,103 @@ public class Conv2DLayer extends Layer {
         final int fChanStride   = kernelH * kernelW;
         final int gOutStride    = outH * outW;
 
-        // Per-thread gradient accumulators. Avoids atomic contention
-        // on filterGrad / biasGrad, which are shared across all samples.
-        final int threads = Parallel.numThreads();
-        final double[][] localWG = new double[threads][filters.size()];
-        final double[][] localBG = new double[threads][outChannels];
-
+        // ---- dZ = dY * f'(z) ----
+        final double[] dZ = new double[B * gSampleStride];
         Parallel.forRange(B, b -> {
-            // Bucket by thread ID. Two threads may share a bucket if
-            // the thread count exceeds `threads`, but each bucket is
-            // still a valid partial sum — the final reduce combines them.
-            int tid = (int) (Thread.currentThread().threadId() % threads);
-            double[] lwg = localWG[tid];
-            double[] lbg = localBG[tid];
+            for (int i = b * gSampleStride, end = i + gSampleStride; i < end; i++)
+                dZ[i] = gD[i] * fn.outputDerivative(zD[i]);
+        });
 
-            int xSampleBase = b * xSampleStride;
-            int gSampleBase = b * gSampleStride;
+        // ---- db: parallel over oc, each owns bg[oc] ----
+        Parallel.forRange(outChannels, oc -> {
+            double sum = 0;
+            for (int b = 0; b < B; b++) {
+                int base = b * gSampleStride + oc * gOutStride;
+                for (int i = 0; i < gOutStride; i++) sum += dZ[base + i];
+            }
+            bg[oc] = sum;
+        });
 
-            for (int oc = 0; oc < outChannels; oc++) {
-                int fOutBase = oc * fOutStride;
-                int gOutBase = gSampleBase + oc * gOutStride;
+        // ---- dW: one task per filter element (oc, ic, kh, kw) ----
+        // Fine-grained so it parallelizes even for small channel counts,
+        // and 4 independent accumulators break the add-latency chain.
+        final int nFilter = outChannels * fOutStride;
+        Parallel.forRange(nFilter, f -> {
+            final int oc   = f / fOutStride;
+            final int rem  = f - oc * fOutStride;
+            final int ic   = rem / fChanStride;
+            final int rem2 = rem - ic * fChanStride;
+            final int kh   = rem2 / kernelW;
+            final int kw   = rem2 - kh * kernelW;
+            final int cLo = lo[kw], cHi = hi[kw];
 
-                for (int oh = 0; oh < outH; oh++) {
-                    int gRowBase = gOutBase + oh * outW;
-                    int ohS = oh * stride - padding;
+            double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
 
-                    for (int ow = 0; ow < outW; ow++) {
-                        int gIdx = gRowBase + ow;
-                        double dZ = gD[gIdx] * fn.outputDerivative(zD[gIdx]);
-                        lbg[oc] += dZ;
+            if (cLo < cHi) {
+                for (int b = 0; b < B; b++) {
+                    final int gOc = b * gSampleStride + oc * gOutStride;
+                    final int xIc = b * xSampleStride + ic * xChanStride;
+                    for (int oh = 0; oh < outH; oh++) {
+                        int ih = oh * stride - padding + kh;
+                        if (ih < 0 || ih >= inH) continue;
+                        final int gRow = gOc + oh * outW;
+                        final int xRow = xIc + ih * inW - padding + kw;
 
-                        for (int ic = 0; ic < inChannels; ic++) {
-                            int xChannelBase = xSampleBase + ic * xChanStride;
-                            int fChannelBase = fOutBase + ic * fChanStride;
+                        int ow = cLo;
+                        for (; ow + 3 < cHi; ow += 4) {
+                            s0 += dZ[gRow + ow]     * xD[xRow + ow * stride];
+                            s1 += dZ[gRow + ow + 1] * xD[xRow + (ow + 1) * stride];
+                            s2 += dZ[gRow + ow + 2] * xD[xRow + (ow + 2) * stride];
+                            s3 += dZ[gRow + ow + 3] * xD[xRow + (ow + 3) * stride];
+                        }
+                        for (; ow < cHi; ow++)
+                            s0 += dZ[gRow + ow] * xD[xRow + ow * stride];
+                    }
+                }
+            }
+            fgD[f] = (s0 + s1) + (s2 + s3);
+        });
 
-                            for (int kh = 0; kh < kernelH; kh++) {
-                                int ih = ohS + kh;
-                                if (ih < 0 || ih >= inH) continue;
-                                int xRowBase = xChannelBase + ih * inW;
-                                int dXRowBase = xChannelBase + ih * inW;
-                                int fRowBase = fChannelBase + kh * kernelW;
+        // ---- dX: parallel over batch, each sample owns its slice ----
+        // Skipped for the first conv (nothing consumes the gradient).
+        if (computeInputGrad) {
+            Parallel.forRange(B, b -> {
+                final int dxBase = b * xSampleStride;
+                final int gBase  = b * gSampleStride;
 
-                                for (int kw = 0; kw < kernelW; kw++) {
-                                    int iw = ow * stride - padding + kw;
-                                    if (iw < 0 || iw >= inW) continue;
-                                    int fIdx = fRowBase + kw;
-                                    double xVal = xD[xRowBase + iw];
-                                    lwg[fIdx] += dZ * xVal;
-                                    dXD[dXRowBase + iw] += dZ * fD[fIdx];
+                for (int oc = 0; oc < outChannels; oc++) {
+                    final int gOc = gBase + oc * gOutStride;
+                    final int fOc = oc * fOutStride;
+
+                    for (int ic = 0; ic < inChannels; ic++) {
+                        final int dxIc = dxBase + ic * xChanStride;
+                        final int fIc  = fOc + ic * fChanStride;
+
+                        for (int kh = 0; kh < kernelH; kh++) {
+                            for (int kw = 0; kw < kernelW; kw++) {
+                                final double w = fD[fIc + kh * kernelW + kw];
+                                final int cLo = lo[kw], cHi = hi[kw];
+                                if (cLo >= cHi) continue;
+
+                                for (int oh = 0; oh < outH; oh++) {
+                                    int ih = oh * stride - padding + kh;
+                                    if (ih < 0 || ih >= inH) continue;
+                                    int gRow  = gOc + oh * outW;
+                                    int dxRow = dxIc + ih * inW - padding + kw;
+
+                                    if (stride == 1) {
+                                        for (int ow = cLo; ow < cHi; ow++)
+                                            dXD[dxRow + ow] += w * dZ[gRow + ow];
+                                    } else {
+                                        for (int ow = cLo; ow < cHi; ow++)
+                                            dXD[dxRow + ow * stride] += w * dZ[gRow + ow];
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
-
-        // Reduce thread-local gradients into the layer's buffers.
-        filterGrad.zero();
-        Arrays.fill(biasGrad, 0.0);
-        double[] fgD = filterGrad.getData();
-        for (int t = 0; t < threads; t++) {
-            double[] lwg = localWG[t];
-            double[] lbg = localBG[t];
-            for (int i = 0; i < lwg.length; i++) fgD[i] += lwg[i];
-            for (int i = 0; i < lbg.length; i++) biasGrad[i] += lbg[i];
+            });
         }
 
         return dInput;
@@ -336,6 +399,7 @@ public class Conv2DLayer extends Layer {
         private int stride = 1, padding = 0;
         private double initStd = -1;
         private long seed = 42;
+        private boolean computeInputGrad = true;
 
         public Builder inChannels(int v)        { this.inChannels = v;  return this; }
         public Builder outChannels(int v)       { this.outChannels = v; return this; }
@@ -345,6 +409,9 @@ public class Conv2DLayer extends Layer {
         public Builder padding(int v)           { this.padding = v;     return this; }
         public Builder initStd(double v)        { this.initStd = v;     return this; }
         public Builder seed(long s)             { this.seed = s;        return this; }
+
+        /** Set false for the first conv: its input gradient is never used. */
+        public Builder computeInputGrad(boolean v) { this.computeInputGrad = v; return this; }
 
         @Override protected Builder self() { return this; }
         @Override public Conv2DLayer build() { return new Conv2DLayer(this); }

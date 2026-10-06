@@ -50,11 +50,11 @@ public class MnistDriver {
 
         // ---- Network ----
         MultiLayerConfiguration cfg = new MultiLayerConfiguration.Builder()
-                .backendRuntime(Backend.CPU)
+                .backendRuntime(Backend.CUDA)
                 .updater(0.001)
                 .optimizer(OptimizerType.ADAM)
                 .lrSchedule(LRScheduleType.COSINE)
-                .batchSize(200)
+                .batchSize(256)
                 .maxEpoch(10)
                 .minError(0.005)
                 .seed(42)

@@ -16,6 +16,13 @@ public final class BackendResolver {
      */
     private static final int GPU_PARAM_THRESHOLD = 100_000;
 
+    /**
+     * -Dmonarch.backend.strict=true makes an explicit METAL/CUDA request throw
+     * instead of silently falling back to the CPU. Recommended while
+     * benchmarking: a silent CPU fallback looks exactly like a slow GPU.
+     */
+    private static final String STRICT_PROPERTY = "monarch.backend.strict";
+
     private BackendResolver() {}
 
     /**
@@ -24,33 +31,18 @@ public final class BackendResolver {
     public static TensorOps resolve(Backend requested, List<Layer> layers) {
         if (requested == null) requested = Backend.CPU;
 
-        // Auto picks based on model size.
         if (requested == Backend.AUTO) {
             int params = countParams(layers);
             if (params < GPU_PARAM_THRESHOLD) {
-                log.info("Model has {} params (< {} threshold) — using CPU",
+                log.info("Model has {} params (< {} threshold) - using CPU",
                         params, GPU_PARAM_THRESHOLD);
                 return CpuTensorOps.INSTANCE;
             }
-            log.info("Model has {} params — considering GPU", params);
-            return tryMetalOrFallback(Backend.AUTO);
+            log.info("Model has {} params - considering GPU", params);
+            return tryTornadoOrFallback(Backend.AUTO);
         }
 
-        // Explicit backend choice — honor it.
-        switch (requested) {
-            case CPU:
-                log.info("Selected backend: CPU");
-                return CpuTensorOps.INSTANCE;
-
-            case METAL:
-                return tryMetalOrFallback(Backend.METAL);
-
-            case CUDA:
-            case OPENCL:
-            default:
-                log.warn("{} is not implemented — falling back to CPU", requested);
-                return CpuTensorOps.INSTANCE;
-        }
+        return resolve(requested);
     }
 
     /** Backward-compatible variant for callers that don't pass layers. */
@@ -60,14 +52,15 @@ public final class BackendResolver {
             case CPU:
                 log.info("Selected backend: CPU");
                 return CpuTensorOps.INSTANCE;
+
             case METAL:
-            case AUTO:
-                return tryMetalOrFallback(requested);
             case CUDA:
+            case AUTO:
+                return tryTornadoOrFallback(requested);
+
             case OPENCL:
             default:
-                log.warn("{} is not implemented — falling back to CPU", requested);
-                return CpuTensorOps.INSTANCE;
+                return fallback(requested, requested + " is not implemented");
         }
     }
 
@@ -80,23 +73,18 @@ public final class BackendResolver {
         return n;
     }
 
-    private static TensorOps tryMetalOrFallback(Backend requested) {
+    // ------------------------------------------------------------------
+    // TornadoVM (CUDA / Metal / AUTO)
+    // ------------------------------------------------------------------
+    private static TensorOps tryTornadoOrFallback(Backend requested) {
         try {
             TornadoBootstrap.init();
         } catch (Throwable t) {
-            log.warn("TornadoBootstrap init failed: {}", t.toString());
-            if (requested == Backend.METAL) {
-                log.warn("METAL explicitly requested but bootstrap failed — using CPU");
-            }
-            return CpuTensorOps.INSTANCE;
+            return fallback(requested, "TornadoBootstrap init failed: " + t);
         }
 
         if (!isClassAvailable("uk.ac.manchester.tornado.api.TornadoExecutionPlan")) {
-            log.info("TornadoVM API not on classpath — using CPU");
-            if (requested == Backend.METAL) {
-                log.warn("METAL explicitly requested but the TornadoVM API is missing");
-            }
-            return CpuTensorOps.INSTANCE;
+            return fallback(requested, "TornadoVM API not on classpath");
         }
 
         try {
@@ -104,23 +92,56 @@ public final class BackendResolver {
                     .getMethod("getTornadoRuntime")
                     .invoke(null);
         } catch (Throwable t) {
-            Throwable cause = unwrap(t);
-            log.warn("TornadoVM runtime init failed: {}", summarize(cause));
-            if (requested == Backend.METAL) {
-                log.warn("METAL explicitly requested but the runtime failed — using CPU");
-            }
-            return CpuTensorOps.INSTANCE;
+            return fallback(requested, "TornadoVM runtime init failed: " + summarize(unwrap(t))
+                    + " (is the app running through the `tornado` launcher with a backend installed?)");
+        }
+
+        // ---- Which device will actually run the kernels? ----
+        Object device;
+        try {
+            device = TornadoDevices.configuredDevice();   // -Dmonarch.tornado.device=b:d
+        } catch (RuntimeException e) {
+            return fallback(requested, e.getMessage());
+        }
+
+        Object probe = device != null ? device : TornadoDevices.defaultDevice();
+        String description = TornadoDevices.describe(probe);
+        Boolean fits = TornadoDevices.matches(requested, description);
+
+        if (Boolean.FALSE.equals(fits)) {
+            return fallback(requested, requested + " requested, but the "
+                    + (device != null ? "pinned" : "default") + " TornadoVM device is '"
+                    + description + "'. Install a TornadoVM build with the matching backend "
+                    + "(CUDA = PTX), or pick the device with -D"
+                    + TornadoDevices.DEVICE_PROPERTY + "=<backend>:<device> "
+                    + "(indices from `tornado --devices`).");
+        }
+        if (description == null && requested != Backend.AUTO) {
+            log.warn("Could not read the TornadoVM device name - assuming the default device "
+                    + "is the requested {} one. Check `tornado --devices`.", requested);
         }
 
         try {
-            MetalTensorOps ops = new MetalTensorOps();
+            TornadoTensorOps ops = new TornadoTensorOps(requested, device, description);
             log.info("Selected backend: {}", ops.name());
             return ops;
         } catch (Throwable t) {
-            Throwable cause = unwrap(t);
-            log.warn("Metal backend init failed: {}", summarize(cause));
-            return CpuTensorOps.INSTANCE;
+            return fallback(requested, "TornadoVM backend init failed: " + summarize(unwrap(t)));
         }
+    }
+
+    /** CPU fallback, or an exception when -Dmonarch.backend.strict=true. */
+    private static TensorOps fallback(Backend requested, String reason) {
+        if (Boolean.getBoolean(STRICT_PROPERTY) && requested != Backend.AUTO) {
+            throw new IllegalStateException(requested + " backend unavailable: " + reason);
+        }
+        if (requested == Backend.METAL || requested == Backend.CUDA) {
+            log.warn("{} explicitly requested but unavailable ({}) - using CPU",
+                    requested, reason);
+        } else {
+            log.warn("{} - using CPU", reason);
+        }
+        return CpuTensorOps.INSTANCE;
     }
 
     private static boolean isClassAvailable(String name) {

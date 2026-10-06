@@ -105,6 +105,11 @@ public class MultiLayerNetwork {
         double bestLoss = Double.MAX_VALUE;
         int epoch;
 
+        // GPU path: whole training step as one device-resident TaskGraph.
+        // null => unsupported model/config, fall back to per-layer ops.
+        final org.monarch.nn.backend.GpuTrainer gpu =
+                org.monarch.nn.backend.GpuTrainer.tryCreate(config, layers, ops);
+
         for (epoch = 0; epoch < maxEpochs; epoch++) {
             long epochStart = System.currentTimeMillis();
 
@@ -116,6 +121,15 @@ public class MultiLayerNetwork {
                 int end = Math.min(i + batchSize, data.size());
                 List<MLData> batch = data.subList(i, end);
                 int B = batch.size();
+
+                if (gpu != null) {
+                    double l = gpu.trainBatch(batch,
+                            lrSchedule.getLR(epoch, globalStep), globalStep + 1);
+                    epochLoss += l;
+                    batches++;
+                    globalStep++;
+                    continue;
+                }
 
                 ops.beginBatch();
 
@@ -179,6 +193,7 @@ public class MultiLayerNetwork {
             }
 
             if (avgLoss <= config.getMinError()) {
+                if (gpu != null) gpu.finish(layers);
                 ui.converged(epoch + 1, bestLoss);
                 log.info("Training converged: epoch={}, loss={}, elapsed={}s",
                         epoch + 1,
@@ -189,6 +204,7 @@ public class MultiLayerNetwork {
             }
         }
 
+        if (gpu != null) gpu.finish(layers);
         ui.finished(epoch, bestLoss);
         log.info("Training finished: epochs={}, loss={}, elapsed={}s",
                 epoch,

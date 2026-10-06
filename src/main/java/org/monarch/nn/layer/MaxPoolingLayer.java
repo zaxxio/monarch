@@ -164,6 +164,10 @@ public class MaxPoolingLayer extends Layer {
 
     @Override public LayerType getType() { return LayerType.MAXPOOL; }
 
+    public int getPoolH()  { return poolH; }
+    public int getPoolW()  { return poolW; }
+    public int getStride() { return stride; }
+
     public static class Builder extends Layer.Builder<MaxPoolingLayer, Builder> {
         private int poolH = 2, poolW = 2, stride = 2;
         public Builder poolSize(int h, int w) { poolH = h; poolW = w; return this; }
